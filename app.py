@@ -1,162 +1,272 @@
-import streamlit as st
-import pandas as pd
-import numpy as np
-import matplotlib.pyplot as plt
-import seaborn as sns
-from sklearn.model_selection import train_test_split
-from sklearn.ensemble import RandomForestClassifier
-from sklearn.preprocessing import LabelEncoder
+from flask import Flask, render_template, request, redirect, url_for, session, flash, send_file
+import sqlite3, os, csv, io, random
+from functools import wraps
+from werkzeug.security import generate_password_hash, check_password_hash
 
-# Page Configuration
-st.set_page_config(
-    page_title="Nutrition Deficiency Analysis",
-    page_icon="🥗",
-    layout="wide"
-)
+app = Flask(__name__)
+app.secret_key = os.environ.get("SECRET_KEY", "change-this-secret-key")
+DB_PATH = os.path.join(os.path.dirname(__file__), "nutrition.db")
 
-# Load Dataset
-@st.cache_data
-def load_data():
-    return pd.read_csv('nutrition_deficiency_local_health_survey.csv')
+def db():
+    conn = sqlite3.connect(DB_PATH)
+    conn.row_factory = sqlite3.Row
+    return conn
 
-df = load_data()
+def init_db():
+    conn = db()
+    conn.execute("""CREATE TABLE IF NOT EXISTS users (
+        id INTEGER PRIMARY KEY AUTOINCREMENT, username TEXT UNIQUE NOT NULL,
+        password_hash TEXT NOT NULL, role TEXT NOT NULL DEFAULT 'user')""")
+    conn.execute("""CREATE TABLE IF NOT EXISTS surveys (
+        id INTEGER PRIMARY KEY AUTOINCREMENT, name TEXT, age INTEGER, gender TEXT,
+        occupation TEXT, fruit_intake TEXT, vegetables TEXT, protein_food TEXT,
+        junk_food TEXT, weakness TEXT, symptoms TEXT, supplements TEXT,
+        skip_meals TEXT, nutrition_awareness TEXT, risk_level TEXT, created_at TEXT DEFAULT CURRENT_TIMESTAMP)""")
+    if conn.execute("SELECT COUNT(*) FROM users").fetchone()[0] == 0:
+        conn.execute("INSERT INTO users(username,password_hash,role) VALUES(?,?,?)",
+                     ("admin", generate_password_hash("admin123"), "admin"))
+        conn.execute("INSERT INTO users(username,password_hash,role) VALUES(?,?,?)",
+                     ("user", generate_password_hash("user123"), "user"))
+    if conn.execute("SELECT COUNT(*) FROM surveys").fetchone()[0] == 0:
+        seed_sample_data(conn, 500)
+    conn.commit()
+    conn.close()
 
-# Train ML Model
-@st.cache_resource
-def train_model(data):
-    df_model = data.copy()
-    le_gender = LabelEncoder()
-    le_area = LabelEncoder()
-    le_diet = LabelEncoder()
-    le_activity = LabelEncoder()
-    le_target = LabelEncoder()
-    
-    df_model['Gender_Enc'] = le_gender.fit_transform(df_model['Gender'])
-    df_model['Area_Enc'] = le_area.fit_transform(df_model['Area'])
-    df_model['Diet_Enc'] = le_diet.fit_transform(df_model['Dietary_Pattern'])
-    df_model['Activity_Enc'] = le_activity.fit_transform(df_model['Physical_Activity'])
-    df_model['Target_Enc'] = le_target.fit_transform(df_model['Nutrition_Deficiency'])
-    
-    features = ['Age', 'BMI', 'Hemoglobin_g_dL', 'Iron_ug_dL', 'Vitamin_D_ng_mL', 
-                'Vitamin_B12_pg_mL', 'Calcium_mg_dL', 'Gender_Enc', 'Area_Enc', 
-                'Diet_Enc', 'Activity_Enc']
-    
-    X = df_model[features]
-    y = df_model['Target_Enc']
-    
-    X_train, X_test, y_train, y_test = train_test_split(X, y, test_size=0.2, random_state=42)
-    model = RandomForestClassifier(n_estimators=100, random_state=42)
-    model.fit(X_train, y_train)
-    return model, le_gender, le_area, le_diet, le_activity, le_target, features
+def risk_score(row):
+    score = 0
+    if row.get("fruit_intake") in ("Never", "Rarely"): score += 2
+    elif row.get("fruit_intake") == "3-4 times/week": score += 1
+    if row.get("vegetables") in ("Rarely", "Never"): score += 2
+    elif row.get("vegetables") == "3-4 times/week": score += 1
+    if row.get("protein_food") == "Rarely": score += 2
+    elif row.get("protein_food") == "Sometimes": score += 1
+    if row.get("junk_food") == "Daily": score += 2
+    elif row.get("junk_food") == "Sometimes": score += 1
+    if row.get("weakness") == "Yes": score += 2
+    if row.get("symptoms") == "Yes": score += 2
+    if row.get("skip_meals") == "Yes": score += 1
+    if row.get("supplements") == "No": score += 1
+    return "High" if score >= 9 else ("Medium" if score >= 5 else "Low")
 
-model, le_gender, le_area, le_diet, le_activity, le_target, feature_cols = train_model(df)
+def seed_sample_data(conn, count):
+    random.seed(42)
+    names = ["Aarav", "Aanya", "Ishaan", "Diya", "Rohan", "Sana", "Kabir", "Meera", "Arjun", "Anaya",
+             "Rahul", "Priya", "Vivek", "Neha", "Karan", "Pooja", "Om", "Sara", "Aditya", "Ira"]
+    choices = {
+      "fruit_intake": ["Daily", "3-4 times/week", "Rarely", "Never"],
+      "vegetables": ["Daily", "3-4 times/week", "Rarely"],
+      "protein_food": ["Daily", "Sometimes", "Rarely"],
+      "junk_food": ["Daily", "Sometimes", "Rarely"],
+      "yesno": ["Yes", "No"]
+    }
+    for i in range(count):
+        r = {
+          "name": random.choice(names) + " " + random.choice(["Sharma","Patel","Khan","Singh","Das","Joshi","More","Rao"]),
+          "age": random.randint(15, 70), "gender": random.choice(["Male","Female","Other"]),
+          "occupation": random.choice(["Student","Employee","Self-employed","Homemaker","Other"]),
+          "fruit_intake": random.choice(choices["fruit_intake"]),
+          "vegetables": random.choice(choices["vegetables"]),
+          "protein_food": random.choice(choices["protein_food"]),
+          "junk_food": random.choice(choices["junk_food"]),
+          "weakness": random.choice(choices["yesno"]),
+          "symptoms": random.choice(choices["yesno"]),
+          "supplements": random.choice(choices["yesno"]),
+          "skip_meals": random.choice(choices["yesno"]),
+          "nutrition_awareness": random.choice(choices["yesno"])
+        }
+        level = risk_score(r)
+        conn.execute("""INSERT INTO surveys(name,age,gender,occupation,fruit_intake,vegetables,protein_food,junk_food,
+          weakness,symptoms,supplements,skip_meals,nutrition_awareness,risk_level)
+          VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
+          (r["name"],r["age"],r["gender"],r["occupation"],r["fruit_intake"],r["vegetables"],r["protein_food"],
+           r["junk_food"],r["weakness"],r["symptoms"],r["supplements"],r["skip_meals"],r["nutrition_awareness"],level))
 
-# App Title & Header
-st.title("🥗 Nutrition Deficiency Analysis Using Local Health Survey Data")
-st.markdown("**B.Sc. Data Science Mini Project** — Exploratory Data Analysis, Multi-Sheet Insights & Machine Learning Diagnostics")
-st.markdown("---")
+def login_required(fn):
+    @wraps(fn)
+    def wrapper(*args, **kwargs):
+        if "user_id" not in session:
+            flash("Please log in to access this page.", "warning")
+            return redirect(url_for("login"))
+        return fn(*args, **kwargs)
+    return wrapper
 
-# Top Metric Cards
-col1, col2, col3, col4 = st.columns(4)
-col1.metric("Total Surveyed Records", len(df))
-col2.metric("Average Cohort Age", f"{df['Age'].mean():.1f} yrs")
-col3.metric("Average Cohort BMI", f"{df['BMI'].mean():.1f} kg/m²")
-col4.metric("ML Model", "Random Forest")
+def admin_required(fn):
+    @wraps(fn)
+    def wrapper(*args, **kwargs):
+        if session.get("role") != "admin":
+            flash("Admin access is required.", "danger")
+            return redirect(url_for("dashboard"))
+        return fn(*args, **kwargs)
+    return wrapper
 
-st.markdown("")
+@app.route("/")
+def home():
+    conn = db()
+    total = conn.execute("SELECT COUNT(*) FROM surveys").fetchone()[0]
+    high = conn.execute("SELECT COUNT(*) FROM surveys WHERE risk_level='High'").fetchone()[0]
+    conn.close()
+    return render_template("home.html", total=total, high=high)
 
-# Multi-Tab Views (Sheets)
-tab1, tab2, tab3, tab4 = st.tabs([
-    "📊 1. Overview & EDA Visuals", 
-    "📋 2. Aggregated Sheets (Area & Diet)", 
-    "🩺 3. ML Diagnostic Predictor", 
-    "📂 4. Raw Data Inspector"
-])
+@app.route("/survey", methods=["GET","POST"])
+def survey():
+    if request.method == "POST":
+        r = {k: request.form.get(k, "").strip() for k in [
+            "name","age","gender","occupation","fruit_intake","vegetables","protein_food",
+            "junk_food","weakness","symptoms","supplements","skip_meals","nutrition_awareness"]}
+        try:
+            age = int(r["age"])
+            if not r["name"] or age < 1 or age > 120: raise ValueError()
+        except ValueError:
+            flash("Enter a name and a valid age (1–120).", "danger")
+            return render_template("survey.html", form=r)
+        r["risk_level"] = risk_score(r)
+        conn = db()
+        conn.execute("""INSERT INTO surveys(name,age,gender,occupation,fruit_intake,vegetables,protein_food,junk_food,
+          weakness,symptoms,supplements,skip_meals,nutrition_awareness,risk_level)
+          VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
+          (r["name"],age,r["gender"],r["occupation"],r["fruit_intake"],r["vegetables"],r["protein_food"],
+           r["junk_food"],r["weakness"],r["symptoms"],r["supplements"],r["skip_meals"],r["nutrition_awareness"],r["risk_level"]))
+        conn.commit(); conn.close()
+        return render_template("result.html", result=r)
+    return render_template("survey.html", form={})
 
-# TAB 1: Overview & EDA Visuals
-with tab1:
-    st.subheader("Exploratory Data Analysis (EDA)")
-    c1, c2 = st.columns(2)
-    
-    with c1:
-        st.markdown("**Distribution of Top Nutritional Deficiencies**")
-        fig, ax = plt.subplots(figsize=(6, 4))
-        sns.countplot(y='Nutrition_Deficiency', data=df, order=df['Nutrition_Deficiency'].value_counts().index[:6], palette='crest', ax=ax)
-        ax.set_ylabel("")
-        ax.set_xlabel("Count")
-        st.pyplot(fig)
-        
-    with c2:
-        st.markdown("**BMI vs Hemoglobin Correlation by Area**")
-        fig, ax = plt.subplots(figsize=(6, 4))
-        sns.scatterplot(data=df, x='BMI', y='Hemoglobin_g_dL', hue='Area', palette='tab10', alpha=0.8, ax=ax)
-        st.pyplot(fig)
+@app.route("/risk")
+def risk():
+    return render_template("risk.html")
 
-# TAB 2: Aggregated Sheets
-with tab2:
-    st.subheader("Aggregated Health Survey Sheets")
-    
-    st.markdown("##### 📍 Sheet A: Aggregation by Geographic Area")
-    area_summary = df.groupby('Area').agg(
-        Count=('Age', 'count'),
-        Mean_BMI=('BMI', lambda x: round(x.mean(), 2)),
-        Mean_Hemoglobin=('Hemoglobin_g_dL', lambda x: round(x.mean(), 2)),
-        Mean_Iron=('Iron_ug_dL', lambda x: round(x.mean(), 2)),
-        Mean_Vitamin_D=('Vitamin_D_ng_mL', lambda x: round(x.mean(), 2))
-    ).reset_index()
-    st.dataframe(area_summary, use_container_width=True)
-    
-    st.markdown("##### 🍲 Sheet B: Aggregation by Dietary Pattern")
-    diet_summary = df.groupby('Dietary_Pattern').agg(
-        Count=('Age', 'count'),
-        Mean_BMI=('BMI', lambda x: round(x.mean(), 2)),
-        Mean_Hemoglobin=('Hemoglobin_g_dL', lambda x: round(x.mean(), 2)),
-        Mean_Iron=('Iron_ug_dL', lambda x: round(x.mean(), 2)),
-        Mean_Vitamin_D=('Vitamin_D_ng_mL', lambda x: round(x.mean(), 2))
-    ).reset_index()
-    st.dataframe(diet_summary, use_container_width=True)
+@app.route("/dashboard")
+@login_required
+def dashboard():
+    conn = db()
+    rows = conn.execute("SELECT * FROM surveys ORDER BY id DESC").fetchall()
+    total = len(rows)
+    levels = {level: sum(1 for r in rows if r["risk_level"] == level) for level in ["Low","Medium","High"]}
+    gender = {}
+    for r in rows: gender[r["gender"]] = gender.get(r["gender"],0)+1
+    age_groups = {"15-24":0,"25-34":0,"35-44":0,"45-59":0,"60+":0}
+    for r in rows:
+        a = r["age"]
+        key = "15-24" if a <= 24 else "25-34" if a <= 34 else "35-44" if a <= 44 else "45-59" if a <= 59 else "60+"
+        age_groups[key] += 1
+    symptom_yes = sum(1 for r in rows if r["symptoms"] == "Yes")
+    weak_yes = sum(1 for r in rows if r["weakness"] == "Yes")
+    recent = rows[:10]
+    conn.close()
+    return render_template("dashboard.html", total=total, levels=levels, gender=gender,
+                           age_groups=age_groups, symptom_yes=symptom_yes, weak_yes=weak_yes, recent=recent)
 
-# TAB 3: ML Diagnostic Predictor
-with tab3:
-    st.subheader("Machine Learning Diagnostic Predictor")
-    st.markdown("Enter patient parameters to infer deficiency risk using the Random Forest model.")
-    
-    with st.form("prediction_form"):
-        col_a, col_b, col_c = st.columns(3)
-        with col_a:
-            age = st.number_input("Age", min_value=1, max_value=120, value=30)
-            gender = st.selectbox("Gender", le_gender.classes_)
-            area = st.selectbox("Area", le_area.classes_)
-            bmi = st.number_input("BMI (kg/m²)", min_value=10.0, max_value=50.0, value=21.5)
-        with col_b:
-            hemoglobin = st.number_input("Hemoglobin (g/dL)", min_value=5.0, max_value=20.0, value=12.0)
-            iron = st.number_input("Iron (µg/dL)", min_value=5.0, max_value=200.0, value=75.0)
-            vit_d = st.number_input("Vitamin D (ng/mL)", min_value=1.0, max_value=100.0, value=24.0)
-        with col_c:
-            vit_b12 = st.number_input("Vitamin B12 (pg/mL)", min_value=50.0, max_value=1000.0, value=350.0)
-            calcium = st.number_input("Calcium (mg/dL)", min_value=4.0, max_value=15.0, value=8.9)
-            diet = st.selectbox("Dietary Pattern", le_diet.classes_)
-            activity = st.selectbox("Physical Activity", le_activity.classes_)
-            
-        submitted = st.form_submit_button("Run Classification Inference")
-        
-        if submitted:
-            g_enc = le_gender.transform([gender])[0]
-            a_enc = le_area.transform([area])[0]
-            d_enc = le_diet.transform([diet])[0]
-            act_enc = le_activity.transform([activity])[0]
-            
-            input_df = pd.DataFrame([[
-                age, bmi, hemoglobin, iron, vit_d, vit_b12, calcium,
-                g_enc, a_enc, d_enc, act_enc
-            ]], columns=feature_cols)
-            
-            pred_enc = model.predict(input_df)[0]
-            result = le_target.inverse_transform([pred_enc])[0]
-            
-            st.success(f"**Diagnostic Prediction Result:** {result}")
+@app.route("/login", methods=["GET","POST"])
+def login():
+    if request.method == "POST":
+        username = request.form.get("username","").strip()
+        password = request.form.get("password","")
+        conn = db()
+        user = conn.execute("SELECT * FROM users WHERE username=?", (username,)).fetchone()
+        conn.close()
+        if user and check_password_hash(user["password_hash"], password):
+            session["user_id"] = user["id"]; session["username"] = user["username"]; session["role"] = user["role"]
+            flash("Login successful.", "success")
+            return redirect(url_for("admin") if user["role"] == "admin" else url_for("dashboard"))
+        flash("Incorrect username or password.", "danger")
+    return render_template("login.html")
 
-# TAB 4: Raw Data Inspector
-with tab4:
-    st.subheader("Raw Survey Dataset Inspector")
-    st.dataframe(df, use_container_width=True)
+@app.route("/logout")
+def logout():
+    session.clear()
+    flash("You have been logged out.", "info")
+    return redirect(url_for("home"))
+
+@app.route("/admin")
+@login_required
+@admin_required
+def admin():
+    conn = db()
+    rows = conn.execute("SELECT * FROM surveys ORDER BY id DESC").fetchall()
+    total = conn.execute("SELECT COUNT(*) FROM surveys").fetchone()[0]
+    users = conn.execute("SELECT id,username,role FROM users ORDER BY id").fetchall()
+    conn.close()
+    return render_template("admin.html", rows=rows, total=total, users=users)
+
+@app.route("/admin/delete/<int:survey_id>", methods=["POST"])
+@login_required
+@admin_required
+def delete_survey(survey_id):
+    conn = db(); conn.execute("DELETE FROM surveys WHERE id=?", (survey_id,)); conn.commit(); conn.close()
+    flash("Survey record deleted.", "success")
+    return redirect(url_for("admin"))
+
+@app.route("/admin/export")
+@login_required
+@admin_required
+def export_csv():
+    conn = db()
+    rows = conn.execute("SELECT * FROM surveys ORDER BY id").fetchall()
+    conn.close()
+    output = io.StringIO()
+    writer = csv.writer(output)
+    if rows:
+        writer.writerow(rows[0].keys())
+        for row in rows: writer.writerow(list(row))
+    mem = io.BytesIO(output.getvalue().encode("utf-8-sig"))
+    mem.seek(0)
+    return send_file(mem, mimetype="text/csv", as_attachment=True, download_name="nutrition_survey_data.csv")
+
+@app.route("/admin/upload", methods=["POST"])
+@login_required
+@admin_required
+def upload_csv():
+    file = request.files.get("file")
+    if not file or not file.filename.lower().endswith(".csv"):
+        flash("Please choose a CSV file.", "danger")
+        return redirect(url_for("admin"))
+    try:
+        text = file.stream.read().decode("utf-8-sig")
+        reader = csv.DictReader(io.StringIO(text))
+        conn = db(); inserted = 0
+        for row in reader:
+            def get(*keys, default=""):
+                for key in keys:
+                    for actual in row:
+                        if actual and actual.strip().lower() == key.lower():
+                            return (row[actual] or default).strip()
+                return default
+            r = {
+              "name": get("name","what is your name", default="Survey participant"),
+              "age": get("age","1. what is your age", default="18"),
+              "gender": get("gender","what is your gender", default="Other"),
+              "occupation": get("occupation","what is your occupation", default="Other"),
+              "fruit_intake": get("fruit_intake","how often do you eat fruits", default="Rarely"),
+              "vegetables": get("vegetables","how often do you eat green leafy vegetables", default="Rarely"),
+              "protein_food": get("protein_food","protein foods eggs/fish/meat", default="Sometimes"),
+              "junk_food": get("junk_food","packaged/junk food", default="Sometimes"),
+              "weakness": get("weakness","tired/weak frequently", default="No"),
+              "symptoms": get("symptoms","hair fall/pale skin/weak nails", default="No"),
+              "supplements": get("supplements","iron/vitamin/mineral supplements", default="No"),
+              "skip_meals": get("skip_meals","skip meals", default="No"),
+              "nutrition_awareness": get("nutrition_awareness","knows nutritional deficiency", default="No")
+            }
+            try: age = max(1, min(120, int(float(r["age"]))))
+            except: age = 18
+            # Normalize common form responses
+            for field in ["fruit_intake","vegetables","protein_food","junk_food","weakness","symptoms","supplements","skip_meals","nutrition_awareness"]:
+                r[field] = r[field].replace(" times a week"," times/week")
+                if r[field].lower() in ("yes","yes."): r[field] = "Yes"
+                if r[field].lower() in ("no","no."): r[field] = "No"
+            level = risk_score(r)
+            conn.execute("""INSERT INTO surveys(name,age,gender,occupation,fruit_intake,vegetables,protein_food,junk_food,
+              weakness,symptoms,supplements,skip_meals,nutrition_awareness,risk_level)
+              VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
+              (r["name"],age,r["gender"],r["occupation"],r["fruit_intake"],r["vegetables"],r["protein_food"],r["junk_food"],
+               r["weakness"],r["symptoms"],r["supplements"],r["skip_meals"],r["nutrition_awareness"],level))
+            inserted += 1
+        conn.commit(); conn.close()
+        flash(f"Imported {inserted} survey rows. Please verify column names and response options.", "success")
+    except Exception as e:
+        flash("Could not read this CSV. Save it as UTF-8 CSV and try again.", "danger")
+    return redirect(url_for("admin"))
+
+with app.app_context():
+    init_db()
+
+if __name__ == "__main__":
+    app.run(debug=True)
